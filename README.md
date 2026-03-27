@@ -9,7 +9,7 @@ It replaces summary-style compaction with reset-style continuity so long chats c
 - auto-compaction resets live history instead of summarizing it,
 - `/compact` follows the same reset flow,
 - continuity is written under `~/.codex/obsidian_graph`,
-- uninstall restores the original Codex binary and removes the managed config block.
+- uninstall restores the original Codex binary when a safe backup exists, or repairs Codex from the official npm package if it does not, then removes the managed config block.
 
 ## Install
 

@@ -138,6 +138,28 @@ try {
   );
   runChecked("node", [codexEntry, "--help"], { cwd: repoRoot, env });
 
+  runChecked("npm", ["install", "-g", tarballPath], { cwd: repoRoot, env });
+
+  const reinstallConfig = fs.readFileSync(configPath, "utf8");
+  assert(reinstallConfig.includes("# BEGIN slopex"), "slopex config block missing after reinstall");
+  assert(
+    sha256File(fakeVendorBinary) === artifactSha256,
+    "Codex binary does not match the slopex artifact after reinstall"
+  );
+
+  fs.rmSync(backupPath, { force: true });
+  runChecked(slopexBin, ["uninstall"], { cwd: repoRoot, env });
+
+  const fallbackConfig = fs.readFileSync(configPath, "utf8");
+  assert(!fallbackConfig.includes("# BEGIN slopex"), "slopex config block still present after fallback uninstall");
+  assert(fallbackConfig.includes('model = "gpt-5.4"'), "user config changed after fallback uninstall");
+  assert(fallbackConfig.includes("[notice]"), "existing TOML table changed after fallback uninstall");
+  assert(
+    sha256File(fakeVendorBinary) === originalVendorSha256,
+    "Codex binary was not restored to the original hash after fallback uninstall"
+  );
+  runChecked("node", [codexEntry, "--help"], { cwd: repoRoot, env });
+
   console.log("Packaged install smoke test passed.");
 } finally {
   if (tarballPath) {
