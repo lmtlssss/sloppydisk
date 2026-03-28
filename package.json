@@ -1,5 +1,5 @@
 {
-  "name": "@lmtlssss/slopex",
+  "name": "slopex-cli",
   "version": "0.1.1",
   "description": "Minimal reset-based continuity patcher for OpenAI Codex.",
   "license": "MIT",

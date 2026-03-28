@@ -17,7 +17,7 @@ Codex must already be installed:
 
 ```bash
 npm install -g @openai/codex
-npm install -g @lmtlssss/slopex
+npm install -g slopex-cli
 ```
 
 The installed package does not build Codex from source. It only does this:

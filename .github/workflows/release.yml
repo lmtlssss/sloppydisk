@@ -46,7 +46,7 @@ jobs:
       - name: Read Npm Version
         id: npm_version
         run: |
-          echo "version=$(npm view @lmtlssss/slopex version 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+          echo "version=$(npm view slopex-cli version 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
 
       - name: Choose Package Version
         id: version
@@ -91,8 +91,8 @@ jobs:
 
       - name: Publish To Npm
         run: |
-          if npm view "@lmtlssss/slopex@${{ steps.version.outputs.next }}" version >/dev/null 2>&1; then
-            echo "@lmtlssss/slopex@${{ steps.version.outputs.next }} is already published; skipping npm publish."
+          if npm view "slopex-cli@${{ steps.version.outputs.next }}" version >/dev/null 2>&1; then
+            echo "slopex-cli@${{ steps.version.outputs.next }} is already published; skipping npm publish."
           else
             npm publish --access public
           fi
