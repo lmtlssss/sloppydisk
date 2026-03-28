@@ -10,20 +10,12 @@
   "files": [
     "bin",
     "lib",
-    "README.md",
-    "LICENSE"
+    "patches"
   ],
   "scripts": {
-    "postinstall": "node bin/sloppydisk.js patch --postinstall",
-    "build-release-artifact": "node scripts/build-release-artifact.cjs",
-    "smoke:packaged": "node scripts/smoke-packaged-install.cjs"
-  },
-  "publishConfig": {
-    "access": "public"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/lmtlssss/slopex.git"
+    "patch": "node bin/sloppydisk.js patch",
+    "status": "node bin/sloppydisk.js status",
+    "unpatch": "node bin/sloppydisk.js unpatch"
   },
   "keywords": [
     "codex",
