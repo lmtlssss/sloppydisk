@@ -775,10 +775,10 @@ index 9ae4e7c..69e9d18 100644
   "codex-core",
 diff --git a/codex-rs/core/src/auto_compact_reset.rs b/codex-rs/core/src/auto_compact_reset.rs
 new file mode 100644
-index 0000000..d282046
+index 0000000..98455d2
 --- /dev/null
 +++ b/codex-rs/core/src/auto_compact_reset.rs
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,374 @@
 +use std::fs;
 +use std::path::{Path, PathBuf};
 +use std::sync::Arc;
@@ -787,14 +787,35 @@ index 0000000..d282046
 +use crate::compact::InitialContextInjection;
 +use crate::config::Config;
 +use crate::error::Result as CodexResult;
-+use crate::protocol::CompactedItem;
++use crate::Prompt;
++use crate::client_common::ResponseEvent;
 +use codex_protocol::items::{ContextCompactionItem, TurnItem};
++use codex_protocol::models::ResponseInputItem;
++use crate::protocol::CompactedItem;
 +use codex_protocol::models::{ContentItem, ResponseItem};
++use futures::prelude::*;
 +use chrono::Utc;
 +use codex_protocol::ThreadId;
++use tracing::warn;
 +
 +const RESET_CATCH_UP_NOTE_NAME: &str = "catch-up.md";
 +const RESET_RECENT_SNIPPET_LIMIT: usize = 3;
++
++const DISTILLATION_PROMPT: &str = r#"
++You are a background cognitive organizer. Your task is to distill the following raw conversation log into a structured, semantic knowledge graph. 
++
++Ignore all previous summaries or meta-commentary. Focus only on the actual events, code changes, tool outputs, and decisions made.
++
++Output your analysis in TWO sections, formatted exactly as follows, using Obsidian Markdown syntax:
++
++# Themes
++(Extract core architectural decisions, persistent state, and recurring technical patterns. Create links like [[themes/database_schema]] where appropriate.)
++- ...
++
++# Timeline
++(Identify the chronological sequence of key milestones, bugs fixed, and task transitions.)
++- ...
++"#;
 +
 +fn obsidian_graph_root(config: &Config) -> &Path {
 +    &config.experimental_obsidian_graph_root
@@ -827,6 +848,119 @@ index 0000000..d282046
 +    )
 +}
 +
++async fn distill_history_to_graph(
++    sess: &Session,
++    turn_context: &TurnContext,
++    history_items: &[ResponseItem],
++) -> CodexResult<String> {
++    let mut client_session = sess.services.model_client.new_session();
++    let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
++
++    let mut raw_log_text = String::new();
++    for item in history_items {
++        if let ResponseItem::Message { role, content, .. } = item {
++            if role != "system" {
++                for c in content {
++                    if let ContentItem::InputText { text } = c {
++                        raw_log_text.push_str(&format!("[{}]: {}\n\n", role, text));
++                    }
++                }
++            }
++        }
++    }
++
++    let full_prompt_text = format!("{}\n\nRAW LOG:\n{}", DISTILLATION_PROMPT, raw_log_text);
++
++    let input_item = ResponseInputItem::Message {
++        role: "user".to_string(),
++        content: vec![codex_protocol::models::ContentItem::InputText { text: full_prompt_text }],
++    };
++
++    let prompt = Prompt {
++        input: vec![input_item.into()],
++        base_instructions: codex_protocol::models::BaseInstructions::default(),
++        personality: None,
++        ..Default::default()
++    };
++
++    let mut stream = client_session
++        .stream(
++            &prompt,
++            &turn_context.model_info,
++            &turn_context.session_telemetry,
++            turn_context.reasoning_effort.clone(),
++            turn_context.reasoning_summary,
++            turn_context.config.service_tier,
++            turn_metadata_header.as_deref(),
++        )
++        .await?;
++
++    let mut distilled_output = String::new();
++
++    loop {
++        let maybe_event = stream.next().await;
++        let Some(event) = maybe_event else { break; };
++        
++        match event {
++            Ok(ResponseEvent::OutputTextDelta(delta)) => {
++                distilled_output.push_str(&delta);
++            }
++            Ok(ResponseEvent::Completed { .. }) => { break; }
++            Err(e) => {
++                warn!("Stream error during distillation: {:?}", e);
++                break;
++            }
++            _ => {}
++        }
++    }
++
++    Ok(distilled_output)
++}
++
++fn parse_and_write_graph(
++    thread_root: &Path,
++    distilled_text: &str,
++) -> std::io::Result<()> {
++    let themes_dir = thread_root.join("themes");
++    let timeline_dir = thread_root.join("timeline");
++    fs::create_dir_all(&themes_dir)?;
++    fs::create_dir_all(&timeline_dir)?;
++
++    let mut in_themes = false;
++    let mut in_timeline = false;
++    let mut themes_content = String::new();
++    let mut timeline_content = String::new();
++
++    for line in distilled_text.lines() {
++        if line.starts_with("# Themes") {
++            in_themes = true;
++            in_timeline = false;
++            continue;
++        } else if line.starts_with("# Timeline") {
++            in_themes = false;
++            in_timeline = true;
++            continue;
++        }
++
++        if in_themes {
++            themes_content.push_str(line);
++            themes_content.push('\n');
++        } else if in_timeline {
++            timeline_content.push_str(line);
++            timeline_content.push('\n');
++        }
++    }
++
++    if !themes_content.trim().is_empty() {
++        fs::write(themes_dir.join("index.md"), themes_content)?;
++    }
++    if !timeline_content.trim().is_empty() {
++        fs::write(timeline_dir.join("overview.md"), timeline_content)?;
++    }
++
++    Ok(())
++}
++
 +pub(crate) async fn run_auto_reset_compact(
 +    sess: Arc<Session>,
 +    turn_context: Arc<TurnContext>,
@@ -835,9 +969,21 @@ index 0000000..d282046
 +    let compaction_item = ContextCompactionItem::new();
 +    sess.emit_turn_item_started(&turn_context, &TurnItem::ContextCompaction(compaction_item.clone())).await;
 +
++    // Phase 1: Rumination (Distill Meaning)
++    sess.notify_background_event(&turn_context, "Ruminating on knowledge graph evolution...".to_string()).await;
++    
 +    let history_snapshot = sess.clone_history().await;
 +    let history_items = history_snapshot.raw_items();
 +    let thread_root = thread_graph_root(&turn_context.config, &sess.conversation_id);
++
++    // The Distillation Engine (Semantic Handoff)
++    if let Ok(distilled_text) = distill_history_to_graph(sess.as_ref(), turn_context.as_ref(), history_items).await {
++        if let Err(e) = parse_and_write_graph(&thread_root, &distilled_text) {
++             warn!("Failed to write distilled graph: {:?}", e);
++        }
++    } else {
++        warn!("Distillation pass failed.");
++    }
 +    
 +    let exported_segment_root = export_graph_segment(
 +        &thread_root,
@@ -858,7 +1004,7 @@ index 0000000..d282046
 +    .await;
 +
 +    let compacted_item = CompactedItem {
-+        message: format!("Context reset. Continuity exported to {}", thread_root.display()),
++        message: format!("Context reset. Meaning graph updated at {}", thread_root.display()),
 +        replacement_history: Some(new_history.clone()),
 +    };
 +
