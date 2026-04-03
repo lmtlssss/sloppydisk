@@ -1,0 +1,15 @@
+{
+  "codexVersion": "0.118.0",
+  "platform": "linux-x64",
+  "targetTriple": "x86_64-unknown-linux-musl",
+  "createdAt": "2026-04-03T18:14:57.748Z",
+  "stockSha256": "64760d0b24804c4d258abc3427811305254f2199a3ddae5de7f443851a43f0bb",
+  "officialSha256": "64760d0b24804c4d258abc3427811305254f2199a3ddae5de7f443851a43f0bb",
+  "patchedSha256": "eb9168cbf31c9a7f09b539edd16e6ce694710fdbcbfee7defbc01404fe39152e",
+  "stockSize": 164790344,
+  "patchedSize": 155578960,
+  "patchFile": "codex.patch.zst",
+  "tool": "zstd --patch-from",
+  "patchSha256": "bc223e7580880ea91220e6017317c96479031cef0a36cb2d92df391d75660922",
+  "patchSize": 30766961
+}

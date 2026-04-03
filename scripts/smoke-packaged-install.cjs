@@ -1,15 +1,21 @@
 #!/usr/bin/env node
-const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
-const { SUPPORTED_CODEX_VERSIONS, artifactPlatformKey } = require("../lib/patcher");
+const {
+  PATCH_ARCHIVE_BASENAME,
+  PATCH_MANIFEST_BASENAME,
+  SUPPORTED_CODEX_VERSIONS,
+  artifactPlatformKey,
+  executableName,
+  sha256File,
+} = require("../lib/patcher");
 
 const repoRoot = path.resolve(__dirname, "..");
 const codexVersion = SUPPORTED_CODEX_VERSIONS[0];
 const platformKey = artifactPlatformKey();
-const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "slopex-smoke-"));
+const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sloppydisk-smoke-"));
 
 let tarballPath = null;
 
@@ -24,17 +30,13 @@ try {
     throw new Error(`Expected a global @openai/codex install at ${sourceCodexDir}`);
   }
 
-  const sourceArtifact = path.join(
-    os.homedir(),
-    ".slopex",
-    "artifacts",
-    codexVersion,
-    platformKey,
-    executableName("codex")
-  );
-  if (!fs.existsSync(sourceArtifact)) {
-    throw new Error(`Expected a cached slopex artifact at ${sourceArtifact}`);
+  const bundleDir = path.join(repoRoot, "artifacts", codexVersion, platformKey);
+  const sourcePatch = path.join(bundleDir, PATCH_ARCHIVE_BASENAME);
+  const sourceManifestPath = path.join(bundleDir, PATCH_MANIFEST_BASENAME);
+  if (!fs.existsSync(sourcePatch) || !fs.existsSync(sourceManifestPath)) {
+    throw new Error(`Expected a packaged sloppydisk patch bundle in ${bundleDir}`);
   }
+  const manifest = JSON.parse(fs.readFileSync(sourceManifestPath, "utf8"));
 
   const packInfo = JSON.parse(runChecked("npm", ["pack", "--json"], { cwd: repoRoot }).stdout)[0];
   tarballPath = path.join(repoRoot, packInfo.filename);
@@ -51,11 +53,11 @@ try {
   if (!fakeVendorBinary) {
     throw new Error(`Could not find copied Codex vendor binary in ${fakeCodexDir}`);
   }
-  const artifactSha256 = sha256File(sourceArtifact);
-  if (sha256File(fakeVendorBinary) === artifactSha256) {
+
+  if (sha256File(fakeVendorBinary) === manifest.patchedSha256) {
     const sourceBackup = path.join(
       os.homedir(),
-      ".slopex",
+      ".sloppydisk",
       "backups",
       `codex-${codexVersion}.original`
     );
@@ -67,55 +69,23 @@ try {
     fs.copyFileSync(sourceBackup, fakeVendorBinary);
     fs.chmodSync(fakeVendorBinary, 0o755);
   }
+
   const originalVendorSha256 = sha256File(fakeVendorBinary);
-
-  const fakeArtifact = path.join(
-    homeDir,
-    ".slopex",
-    "artifacts",
-    codexVersion,
-    platformKey,
-    executableName("codex")
-  );
-  ensureDir(path.dirname(fakeArtifact));
-  fs.copyFileSync(sourceArtifact, fakeArtifact);
-  fs.chmodSync(fakeArtifact, 0o755);
-
-  const configPath = path.join(homeDir, ".codex", "config.toml");
-  ensureDir(path.dirname(configPath));
-  fs.writeFileSync(
-    configPath,
-    [
-      'model = "gpt-5.4"',
-      'service_tier = "fast"',
-      "",
-      "[notice]",
-      "hide_rate_limit_model_nudge = true",
-      ""
-    ].join("\n")
+  assert(
+    originalVendorSha256 === manifest.officialSha256,
+    `Expected copied Codex binary to match official hash ${manifest.officialSha256}, got ${originalVendorSha256}`
   );
 
   runChecked("npm", ["install", "-g", tarballPath], { cwd: repoRoot, env });
 
-  const installedConfig = fs.readFileSync(configPath, "utf8");
-  assert(installedConfig.includes("# BEGIN slopex"), "slopex config block missing after install");
-  assert(installedConfig.includes('model = "gpt-5.4"'), "user config was not preserved");
-  assert(installedConfig.includes("[notice]"), "existing TOML table was not preserved");
-  const slopexIndex = installedConfig.indexOf("# BEGIN slopex");
-  const noticeIndex = installedConfig.indexOf("[notice]");
-  assert(
-    noticeIndex === -1 || slopexIndex < noticeIndex,
-    "slopex config block was inserted after a TOML table header"
-  );
-
   const installedVendorSha256 = sha256File(fakeVendorBinary);
   assert(installedVendorSha256 !== originalVendorSha256, "Codex binary did not change after install");
   assert(
-    installedVendorSha256 === artifactSha256,
-    "Installed Codex binary does not match the slopex artifact"
+    installedVendorSha256 === manifest.patchedSha256,
+    "Installed Codex binary does not match the packaged sloppydisk patch manifest"
   );
 
-  const backupPath = path.join(homeDir, ".slopex", "backups", `codex-${codexVersion}.original`);
+  const backupPath = path.join(homeDir, ".sloppydisk", "backups", `codex-${codexVersion}.original`);
   assert(fs.existsSync(backupPath), "Original Codex backup was not created");
   assert(
     sha256File(backupPath) === originalVendorSha256,
@@ -124,36 +94,26 @@ try {
 
   const codexEntry = resolveCodexEntry(fakeCodexDir);
   runChecked("node", [codexEntry, "--help"], { cwd: repoRoot, env });
-
   const toolBin = path.join(prefixDir, "bin", executableName("sloppydisk"));
-  runChecked(toolBin, ["stock"], { cwd: repoRoot, env });
+  runChecked(toolBin, ["status"], { cwd: repoRoot, env });
 
-  const uninstalledConfig = fs.readFileSync(configPath, "utf8");
-  assert(!uninstalledConfig.includes("# BEGIN slopex"), "slopex config block still present after uninstall");
-  assert(uninstalledConfig.includes('model = "gpt-5.4"'), "user config changed after uninstall");
-  assert(uninstalledConfig.includes("[notice]"), "existing TOML table changed after uninstall");
+  runChecked("npm", ["uninstall", "-g", "sloppydisk"], { cwd: repoRoot, env });
+  runChecked("node", [codexEntry, "--help"], { cwd: repoRoot, env });
   assert(
     sha256File(fakeVendorBinary) === originalVendorSha256,
-    "Codex binary was not restored to the original hash after uninstall"
+    "Codex binary was not restored to the original hash after npm uninstall self-repair"
   );
-  runChecked("node", [codexEntry, "--help"], { cwd: repoRoot, env });
 
+  runChecked("npm", ["install", "-g", tarballPath], { cwd: repoRoot, env });
   runChecked(toolBin, ["patch"], { cwd: repoRoot, env });
-
-  const reinstallConfig = fs.readFileSync(configPath, "utf8");
-  assert(reinstallConfig.includes("# BEGIN slopex"), "slopex config block missing after reinstall");
   assert(
-    sha256File(fakeVendorBinary) === artifactSha256,
-    "Codex binary does not match the slopex artifact after reinstall"
+    sha256File(fakeVendorBinary) === manifest.patchedSha256,
+    "Codex binary does not match the sloppydisk patch manifest after reinstall"
   );
 
   fs.rmSync(backupPath, { force: true });
   runChecked(toolBin, ["stock"], { cwd: repoRoot, env });
 
-  const fallbackConfig = fs.readFileSync(configPath, "utf8");
-  assert(!fallbackConfig.includes("# BEGIN slopex"), "slopex config block still present after fallback uninstall");
-  assert(fallbackConfig.includes('model = "gpt-5.4"'), "user config changed after fallback uninstall");
-  assert(fallbackConfig.includes("[notice]"), "existing TOML table changed after fallback uninstall");
   assert(
     sha256File(fakeVendorBinary) === originalVendorSha256,
     "Codex binary was not restored to the original hash after fallback uninstall"
@@ -206,23 +166,13 @@ function findVendorBinary(codexDir) {
   return null;
 }
 
-function sha256File(filePath) {
-  const hash = crypto.createHash("sha256");
-  hash.update(fs.readFileSync(filePath));
-  return hash.digest("hex");
-}
-
 function createTestEnv(prefixDir, homeDir) {
   return {
     ...process.env,
     HOME: homeDir,
     npm_config_prefix: prefixDir,
-    PATH: `${path.join(prefixDir, "bin")}${path.delimiter}${process.env.PATH || ""}`
+    PATH: `${path.join(prefixDir, "bin")}${path.delimiter}${process.env.PATH || ""}`,
   };
-}
-
-function executableName(baseName) {
-  return process.platform === "win32" ? `${baseName}.exe` : baseName;
 }
 
 function ensureDir(dirPath) {
@@ -240,7 +190,7 @@ function runChecked(command, args, options = {}) {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.error) {
     throw result.error;

@@ -1,23 +1,24 @@
 #!/usr/bin/env node
 
 const path = require("node:path");
-const { installSlopex, printStatus, uninstallSlopex } = require("../lib/patcher");
+const { installSloppydisk, printStatus, uninstallSloppydisk } = require("../lib/patcher");
 
 const TOOL_NAME = "sloppydisk";
 
 async function main() {
   const [command, ...args] = process.argv.slice(2);
   const postinstall = args.includes("--postinstall");
+  const lifecycle = args.includes("--lifecycle");
   const normalized = command || "help";
 
   switch (normalized) {
     case "patch":
     case "install":
-      await installSlopex({ postinstall });
+      await installSloppydisk({ postinstall: postinstall || lifecycle });
       break;
     case "stock":
     case "uninstall":
-      await uninstallSlopex();
+      await uninstallSloppydisk({ lifecycle });
       break;
     case "status":
       await printStatus();

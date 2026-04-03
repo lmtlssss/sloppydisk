@@ -1,7 +1,7 @@
 {
   "name": "sloppydisk",
-  "version": "0.1.3",
-  "description": "Minimal reset-based continuity patcher for OpenAI Codex.",
+  "version": "0.2.0",
+  "description": "Minimal contract-preserving reset patcher for OpenAI Codex.",
   "license": "MIT",
   "type": "commonjs",
   "bin": {
@@ -10,12 +10,17 @@
   "files": [
     "bin",
     "lib",
+    "artifacts",
     "patches"
   ],
   "scripts": {
     "patch": "node bin/sloppydisk.js patch",
     "status": "node bin/sloppydisk.js status",
-    "unpatch": "node bin/sloppydisk.js unpatch"
+    "stock": "node bin/sloppydisk.js stock",
+    "postinstall": "node bin/sloppydisk.js patch --lifecycle",
+    "preuninstall": "node bin/sloppydisk.js stock --lifecycle",
+    "build-release-artifact": "node scripts/build-release-artifact.cjs",
+    "smoke-packaged-install": "node scripts/smoke-packaged-install.cjs"
   },
   "keywords": [
     "codex",

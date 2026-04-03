@@ -1,0 +1,548 @@
+diff --git a/codex-rs/core/src/auto_compact_reset.rs b/codex-rs/core/src/auto_compact_reset.rs
+new file mode 100644
+index 0000000..942226f
+--- /dev/null
++++ b/codex-rs/core/src/auto_compact_reset.rs
+@@ -0,0 +1,409 @@
++use std::collections::HashSet;
++use std::fs;
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++
++use chrono::Utc;
++use codex_protocol::ThreadId;
++use codex_protocol::items::{ContextCompactionItem, TurnItem};
++use codex_protocol::models::{ContentItem, ResponseItem};
++
++use crate::codex::{Session, TurnContext};
++use crate::compact::InitialContextInjection;
++use crate::error::Result as CodexResult;
++use crate::protocol::CompactedItem;
++
++const CONTINUITY_DIR_NAME: &str = "sloppydisk";
++const THREADS_DIR_NAME: &str = "threads";
++const CATCH_UP_FILE_NAME: &str = "catch-up.md";
++const CONTRACT_FILE_NAME: &str = "contract.md";
++const SEGMENTS_DIR_NAME: &str = "segments";
++const SEGMENT_HISTORY_FILE_NAME: &str = "history.json";
++const RECENT_USER_MESSAGE_LIMIT: usize = 4;
++const DIRECTIVE_MESSAGE_LIMIT: usize = 8;
++const DIRECTIVE_SCAN_LIMIT: usize = 24;
++
++pub(crate) async fn run_auto_reset_compact(
++    sess: Arc<Session>,
++    turn_context: Arc<TurnContext>,
++    initial_context_injection: InitialContextInjection,
++) -> CodexResult<()> {
++    let compaction_item = ContextCompactionItem::new();
++    sess.emit_turn_item_started(
++        &turn_context,
++        &TurnItem::ContextCompaction(compaction_item.clone()),
++    )
++    .await;
++
++    let history_snapshot = sess.clone_history().await;
++    let history_items = history_snapshot.raw_items();
++    let thread_root = thread_root(turn_context.as_ref(), &sess.conversation_id);
++    export_thread_memory(
++        &thread_root,
++        continuity_root(turn_context.as_ref()).as_path(),
++        &sess.conversation_id,
++        &turn_context.sub_id,
++        history_items,
++    )
++    .ok();
++
++    let reset_map_capsule = build_reset_map_capsule(&thread_root);
++    let (mut new_history, reference_context_item) = build_reset_replacement_history(
++        sess.as_ref(),
++        turn_context.as_ref(),
++        initial_context_injection,
++        reset_map_capsule,
++    )
++    .await;
++    append_ghost_snapshots(&mut new_history, history_items);
++
++    let compacted_item = CompactedItem {
++        message: format!(
++            "Context reset. Continuity updated at {}",
++            thread_root.display()
++        ),
++        replacement_history: Some(new_history.clone()),
++    };
++
++    sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
++        .await;
++    sess.recompute_token_usage(&turn_context).await;
++    sess.emit_turn_item_completed(&turn_context, TurnItem::ContextCompaction(compaction_item))
++        .await;
++
++    Ok(())
++}
++
++fn continuity_root(turn_context: &TurnContext) -> PathBuf {
++    turn_context.config.codex_home.join(CONTINUITY_DIR_NAME)
++}
++
++fn thread_root(turn_context: &TurnContext, thread_id: &ThreadId) -> PathBuf {
++    continuity_root(turn_context)
++        .join(THREADS_DIR_NAME)
++        .join(thread_id.to_string())
++}
++
++async fn build_reset_replacement_history(
++    sess: &Session,
++    turn_context: &TurnContext,
++    initial_context_injection: InitialContextInjection,
++    reset_map_capsule: ResponseItem,
++) -> (
++    Vec<ResponseItem>,
++    Option<codex_protocol::protocol::TurnContextItem>,
++) {
++    let history_snapshot = sess.clone_history().await;
++    let history_items = history_snapshot.raw_items();
++    let recent_user_message = history_items.iter().rev().find_map(|item| match item {
++        ResponseItem::Message { role, .. } if role == "user" => Some(item.clone()),
++        _ => None,
++    });
++
++    match initial_context_injection {
++        InitialContextInjection::DoNotInject => {
++            let mut history = vec![reset_map_capsule];
++            if let Some(msg) = recent_user_message {
++                history.push(msg);
++            }
++            (history, None)
++        }
++        InitialContextInjection::BeforeLastUserMessage => {
++            let mut history = sess.build_initial_context(turn_context).await;
++            history.push(reset_map_capsule);
++            if let Some(msg) = recent_user_message {
++                history.push(msg);
++            }
++            (history, Some(turn_context.to_turn_context_item()))
++        }
++    }
++}
++
++fn append_ghost_snapshots(history: &mut Vec<ResponseItem>, history_items: &[ResponseItem]) {
++    history.extend(
++        history_items
++            .iter()
++            .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
++            .cloned(),
++    );
++}
++
++fn build_reset_map_capsule(thread_root: &Path) -> ResponseItem {
++    let catch_up_path = thread_root.join(CATCH_UP_FILE_NAME);
++    let contract_path = thread_root.join(CONTRACT_FILE_NAME);
++    let segments_path = thread_root.join(SEGMENTS_DIR_NAME);
++    let content = format!(
++        "Context reset without summary reinjection. Preserve the latest user message as the current steer. If older thread context matters, read `{}` first, then `{}`. Use `{}` only when deeper raw chronology is required. Treat quoted user directives as source of truth over inferred summaries.",
++        catch_up_path.display(),
++        contract_path.display(),
++        segments_path.display(),
++    );
++
++    ResponseItem::Message {
++        id: None,
++        role: "system".to_string(),
++        content: vec![ContentItem::InputText { text: content }],
++        phase: None,
++        end_turn: None,
++    }
++}
++
++fn export_thread_memory(
++    thread_root: &Path,
++    continuity_root: &Path,
++    thread_id: &ThreadId,
++    turn_id: &str,
++    history_items: &[ResponseItem],
++) -> std::io::Result<PathBuf> {
++    let timestamp = Utc::now();
++    let segment_id = format!("{}-{}", timestamp.format("%Y%m%dT%H%M%SZ"), turn_id);
++    let segment_root = thread_root.join(SEGMENTS_DIR_NAME).join(&segment_id);
++    fs::create_dir_all(&segment_root)?;
++    fs::write(
++        segment_root.join(SEGMENT_HISTORY_FILE_NAME),
++        serde_json::to_vec_pretty(history_items).map_err(std::io::Error::other)?,
++    )?;
++
++    write_reset_catch_up_note(thread_root, thread_id, history_items)?;
++    write_contract_note(thread_root, history_items)?;
++    write_thread_index(thread_root, thread_id)?;
++    write_machine_index(continuity_root)?;
++    Ok(segment_root)
++}
++
++fn write_reset_catch_up_note(
++    thread_root: &Path,
++    thread_id: &ThreadId,
++    history_items: &[ResponseItem],
++) -> std::io::Result<()> {
++    let catch_up_path = thread_root.join(CATCH_UP_FILE_NAME);
++    let contract_path = thread_root.join(CONTRACT_FILE_NAME);
++    let recent_messages = recent_user_messages(history_items, RECENT_USER_MESSAGE_LIMIT);
++    let latest_user_message = recent_messages
++        .first()
++        .cloned()
++        .unwrap_or_else(|| "No recent user message found.".to_string());
++
++    let mut body = format!(
++        "# Reset Catch-Up\n\n- Thread: `{}`\n- Read this file first after a reset.\n- Then read `{}` for exact recent directives.\n\n## Live Ask\n\n{}\n\n## Recent User Messages\n\n",
++        thread_id,
++        contract_path.display(),
++        quote_markdown(&latest_user_message),
++    );
++
++    if recent_messages.is_empty() {
++        body.push_str("- No recent user messages found.\n");
++    } else {
++        for message in recent_messages {
++            body.push_str(&quote_markdown(&message));
++            body.push('\n');
++        }
++    }
++
++    fs::write(catch_up_path, body)
++}
++
++fn write_contract_note(thread_root: &Path, history_items: &[ResponseItem]) -> std::io::Result<()> {
++    let contract_path = thread_root.join(CONTRACT_FILE_NAME);
++    let directives = recent_directive_messages(history_items);
++
++    let mut body = String::from(
++        "# Contract\n\nExact recent user messages that look like hard constraints, corrections, or anti-goals. Treat them as the protected contract before inferring anything broader.\n\n",
++    );
++
++    if directives.is_empty() {
++        body.push_str("- No directive-style user messages detected in the recent scan window.\n");
++    } else {
++        for directive in directives {
++            body.push_str(&quote_markdown(&directive));
++            body.push('\n');
++        }
++    }
++
++    fs::write(contract_path, body)
++}
++
++fn write_thread_index(thread_root: &Path, thread_id: &ThreadId) -> std::io::Result<()> {
++    let segments_root = thread_root.join(SEGMENTS_DIR_NAME);
++    let mut segment_names = if segments_root.exists() {
++        fs::read_dir(&segments_root)?
++            .filter_map(Result::ok)
++            .filter_map(|entry| {
++                entry
++                    .file_type()
++                    .ok()
++                    .filter(|ft| ft.is_dir())
++                    .map(|_| entry.file_name().to_string_lossy().into_owned())
++            })
++            .collect::<Vec<_>>()
++    } else {
++        Vec::new()
++    };
++    segment_names.sort();
++    segment_names.reverse();
++
++    let mut body = format!(
++        "# Thread {}\n\n- Catch-up: [[{}]]\n- Contract: [[{}]]\n\n## Raw Segments\n",
++        thread_id, CATCH_UP_FILE_NAME, CONTRACT_FILE_NAME
++    );
++
++    if segment_names.is_empty() {
++        body.push_str("- No raw segments exported yet.\n");
++    } else {
++        for name in segment_names {
++            body.push_str(&format!(
++                "- `segments/{}/{}`\n",
++                name, SEGMENT_HISTORY_FILE_NAME
++            ));
++        }
++    }
++
++    fs::write(thread_root.join("index.md"), body)
++}
++
++fn write_machine_index(continuity_root: &Path) -> std::io::Result<()> {
++    let threads_root = continuity_root.join(THREADS_DIR_NAME);
++    fs::create_dir_all(&threads_root)?;
++
++    let mut thread_names = fs::read_dir(&threads_root)?
++        .filter_map(Result::ok)
++        .filter_map(|entry| {
++            entry
++                .file_type()
++                .ok()
++                .filter(|ft| ft.is_dir())
++                .map(|_| entry.file_name().to_string_lossy().into_owned())
++        })
++        .collect::<Vec<_>>();
++    thread_names.sort();
++    thread_names.reverse();
++
++    let mut body = String::from("# Continuity Index\n\n");
++    if thread_names.is_empty() {
++        body.push_str("- No threads exported yet.\n");
++    } else {
++        for name in thread_names {
++            body.push_str(&format!("- [[threads/{}/index|{}]]\n", name, name));
++        }
++    }
++
++    fs::write(continuity_root.join("index.md"), body)
++}
++
++fn recent_user_messages(history_items: &[ResponseItem], limit: usize) -> Vec<String> {
++    history_items
++        .iter()
++        .rev()
++        .filter_map(user_message_text)
++        .filter(|text| !text.trim().is_empty())
++        .take(limit)
++        .collect()
++}
++
++fn recent_directive_messages(history_items: &[ResponseItem]) -> Vec<String> {
++    let mut directives = Vec::new();
++    let mut seen = HashSet::new();
++
++    for text in history_items
++        .iter()
++        .rev()
++        .filter_map(user_message_text)
++        .filter(|text| !text.trim().is_empty())
++        .take(DIRECTIVE_SCAN_LIMIT)
++    {
++        let normalized = text.trim();
++        if !looks_like_directive(normalized) {
++            continue;
++        }
++        if seen.insert(normalized.to_string()) {
++            directives.push(normalized.to_string());
++        }
++        if directives.len() >= DIRECTIVE_MESSAGE_LIMIT {
++            break;
++        }
++    }
++
++    directives
++}
++
++fn user_message_text(item: &ResponseItem) -> Option<String> {
++    match item {
++        ResponseItem::Message { role, content, .. } if role == "user" => {
++            message_content_text(content)
++        }
++        _ => None,
++    }
++}
++
++fn message_content_text(content: &[ContentItem]) -> Option<String> {
++    let text = content
++        .iter()
++        .filter_map(|item| match item {
++            ContentItem::InputText { text } => Some(text.as_str()),
++            ContentItem::OutputText { text } => Some(text.as_str()),
++            ContentItem::InputImage { .. } => None,
++        })
++        .collect::<Vec<_>>()
++        .join("\n")
++        .trim()
++        .to_string();
++
++    if text.is_empty() { None } else { Some(text) }
++}
++
++fn looks_like_directive(text: &str) -> bool {
++    let lower = text.to_ascii_lowercase();
++    let markers = [
++        "do not",
++        "don't",
++        "must",
++        "mustn't",
++        "never",
++        "only",
++        "exact",
++        "exactly",
++        "preserve",
++        "keep ",
++        "critical",
++        "important",
++        "same",
++        "without",
++        "no ",
++        "wrong",
++        "stop ",
++    ];
++
++    markers.iter().any(|marker| lower.contains(marker))
++}
++
++fn quote_markdown(text: &str) -> String {
++    let mut quoted = String::new();
++    for line in text.lines() {
++        quoted.push_str("> ");
++        quoted.push_str(line);
++        quoted.push('\n');
++    }
++    quoted
++}
++
++#[cfg(test)]
++mod tests {
++    use super::looks_like_directive;
++    use super::quote_markdown;
++
++    #[test]
++    fn directive_detection_finds_constraints() {
++        assert!(looks_like_directive(
++            "do not summarize this and preserve the exact user directive"
++        ));
++        assert!(looks_like_directive(
++            "keep the geometry exact, everything else the same"
++        ));
++        assert!(!looks_like_directive("thanks, looks good"));
++    }
++
++    #[test]
++    fn quote_markdown_preserves_multiline_blocks() {
++        assert_eq!(quote_markdown("one\ntwo"), "> one\n> two\n");
++    }
++}
+diff --git a/codex-rs/core/src/codex.rs b/codex-rs/core/src/codex.rs
+index 2c70aad..5403d55 100644
+--- a/codex-rs/core/src/codex.rs
++++ b/codex-rs/core/src/codex.rs
+@@ -16,12 +16,10 @@ use crate::agent::MailboxReceiver;
+ use crate::agent::agent_status_from_event;
+ use crate::apps::render_apps_section;
+ use crate::auth_env_telemetry::collect_auth_env_telemetry;
++use crate::auto_compact_reset::run_auto_reset_compact;
+ use crate::commit_attribution::commit_message_trailer_instruction;
+ use crate::compact;
+ use crate::compact::InitialContextInjection;
+-use crate::compact::run_inline_auto_compact_task;
+-use crate::compact::should_use_remote_compact_task;
+-use crate::compact_remote::run_inline_remote_auto_compact_task;
+ use crate::config::ManagedFeatures;
+ use crate::connectors;
+ use crate::exec_policy::ExecPolicyManager;
+@@ -6146,21 +6144,12 @@ async fn run_auto_compact(
+     turn_context: &Arc<TurnContext>,
+     initial_context_injection: InitialContextInjection,
+ ) -> CodexResult<()> {
+-    if should_use_remote_compact_task(&turn_context.provider) {
+-        run_inline_remote_auto_compact_task(
+-            Arc::clone(sess),
+-            Arc::clone(turn_context),
+-            initial_context_injection,
+-        )
+-        .await?;
+-    } else {
+-        run_inline_auto_compact_task(
+-            Arc::clone(sess),
+-            Arc::clone(turn_context),
+-            initial_context_injection,
+-        )
+-        .await?;
+-    }
++    run_auto_reset_compact(
++        Arc::clone(sess),
++        Arc::clone(turn_context),
++        initial_context_injection,
++    )
++    .await?;
+     Ok(())
+ }
+ 
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+index 82fd5c1..bf51d9f 100644
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -2,6 +2,7 @@ use std::sync::Arc;
+ 
+ use crate::ModelProviderInfo;
+ use crate::Prompt;
++use crate::auto_compact_reset::run_auto_reset_compact;
+ use crate::client::ModelClientSession;
+ use crate::client_common::ResponseEvent;
+ #[cfg(test)]
+@@ -51,6 +52,7 @@ pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bo
+     provider.is_openai()
+ }
+ 
++#[allow(dead_code)]
+ pub(crate) async fn run_inline_auto_compact_task(
+     sess: Arc<Session>,
+     turn_context: Arc<TurnContext>,
+@@ -87,12 +89,16 @@ pub(crate) async fn run_compact_task(
+     .await
+ }
+ 
++#[allow(unreachable_code)]
+ async fn run_compact_task_inner(
+     sess: Arc<Session>,
+     turn_context: Arc<TurnContext>,
+     input: Vec<UserInput>,
+     initial_context_injection: InitialContextInjection,
+ ) -> CodexResult<()> {
++    let _ = input;
++    return run_auto_reset_compact(sess, turn_context, initial_context_injection).await;
++
+     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+     sess.emit_turn_item_started(&turn_context, &compaction_item)
+         .await;
+diff --git a/codex-rs/core/src/compact_remote.rs b/codex-rs/core/src/compact_remote.rs
+index 28be574..3293d1a 100644
+--- a/codex-rs/core/src/compact_remote.rs
++++ b/codex-rs/core/src/compact_remote.rs
+@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
+ use tracing::error;
+ use tracing::info;
+ 
++#[allow(dead_code)]
+ pub(crate) async fn run_inline_remote_auto_compact_task(
+     sess: Arc<Session>,
+     turn_context: Arc<TurnContext>,
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index cc2861c..6cf11b3 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -11,6 +11,7 @@ mod apps;
+ mod arc_monitor;
+ pub use codex_login as auth;
+ mod auth_env_telemetry;
++mod auto_compact_reset;
+ mod client;
+ mod client_common;
+ pub mod codex;
+diff --git a/codex-rs/linux-sandbox/build.rs b/codex-rs/linux-sandbox/build.rs
+index 700aade..ba0711c 100644
+--- a/codex-rs/linux-sandbox/build.rs
++++ b/codex-rs/linux-sandbox/build.rs
+@@ -6,6 +6,7 @@ fn main() {
+     // Tell rustc/clippy that this is an expected cfg value.
+     println!("cargo:rustc-check-cfg=cfg(vendored_bwrap_available)");
+     println!("cargo:rerun-if-env-changed=CODEX_BWRAP_SOURCE_DIR");
++    println!("cargo:rerun-if-env-changed=CODEX_SKIP_VENDORED_BWRAP");
+     println!("cargo:rerun-if-env-changed=PKG_CONFIG_ALLOW_CROSS");
+     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+     println!("cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR");
+@@ -35,6 +36,13 @@ fn main() {
+         return;
+     }
+ 
++    if env::var_os("CODEX_SKIP_VENDORED_BWRAP").is_some_and(|value| value != "0") {
++        println!(
++            "cargo:warning=skipping vendored bubblewrap build because CODEX_SKIP_VENDORED_BWRAP is set"
++        );
++        return;
++    }
++
+     if let Err(err) = try_build_vendored_bwrap() {
+         panic!("failed to compile vendored bubblewrap for Linux target: {err}");
+     }
